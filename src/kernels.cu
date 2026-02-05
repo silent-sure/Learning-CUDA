@@ -4,6 +4,38 @@
 
 #include "../tester/utils.h"
 
+template <typename T>
+__device__ T warpReduce(T val, int warp_size) {
+  #pragma unroll
+  for (int stride = warp_size >> 1; stride > 0; stride >>= 1) {
+    val += __shfl_down_sync(0xffffffff, val, stride);
+  }
+  return val;
+}
+
+template <typename T>
+__global__ void traceKernel(T* A, T* result, int n, int cols,
+    int warp_size, int num_warps) {
+  int idx = threadIdx.x + blockIdx.x*blockDim.x;
+  int warp_id = threadIdx.x / warp_size;
+  int lane_id = threadIdx.x % warp_size;
+  extern __shared__ char pool[];
+  T* smem = (T*)pool;
+  T val = idx < n ? A[idx*cols + idx] : T(0);
+  T warp_sum = warpReduce(val, warp_size);
+  if (lane_id == 0) {
+    smem[warp_id] = warp_sum;
+  }
+  __syncthreads();
+  if (warp_id == 0) {
+    T block_sum = lane_id < num_warps ? smem[lane_id] : T(0);
+    block_sum = warpReduce(block_sum, warp_size);
+    if (lane_id == 0) {
+      atomicAdd(result, block_sum);
+    }
+  }
+}
+
 /**
  * @brief Computes the trace of a matrix.
  *
@@ -20,27 +52,31 @@
  */
 
 template <typename T>
-__global__ void traceKernel(T* A, T* result, int n, int cols) {
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid < n) {
-    atomicAdd(result, A[tid * cols + tid]);
-  }
-}
-
-template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
+  // Get warp size
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  const int warp_size = prop.warpSize;
+
+  // Prepare
   T* d_input;
-  cudaMalloc((void**)&d_input, rows * cols * sizeof(T));
-  cudaMemcpy(d_input, h_input.data(), rows * cols * sizeof(T),
-             cudaMemcpyHostToDevice);
   T* d_result;
+  cudaMalloc((void**)&d_input, rows * cols * sizeof(T));
   cudaMalloc((void**)&d_result, sizeof(T));
+  cudaMemcpy(d_input, h_input.data(), rows * cols * sizeof(T), cudaMemcpyHostToDevice);
   cudaMemset(d_result, 0, sizeof(T));
-  int blockSize = 256;
+
+  // Launch kernel
+  int block_size = 256;
   int n = std::min(rows, cols);
-  int numBlocks = (n + blockSize - 1) / blockSize;
-  traceKernel<<<numBlocks, blockSize>>>(d_input, d_result, n, int(cols));
+  int num_blocks = (n + block_size - 1) / block_size;
+  int num_warps = (block_size + warp_size - 1) / warp_size;
+  traceKernel<<<num_blocks, block_size, num_warps * sizeof(T)>>>(
+    d_input, d_result, n, int(cols), warp_size, num_warps
+  );
   cudaDeviceSynchronize();
+
+  // Copy result, wrap up
   T result;
   cudaMemcpy(&result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
   cudaFree(d_input);
@@ -48,8 +84,8 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   return result;
 }
 
-constexpr int BS = 32;
-constexpr int MAGIC = 64;
+constexpr int BS = 64;
+constexpr int MAXD = 64;
 
 __device__ __forceinline__ int swizzle(int r, int c) {
   return r << 6 | (c ^ r);
@@ -72,8 +108,8 @@ __global__ void flashAttentionKernel(const T* Q, const T* K, const T* V,
   // Define SRAM for Q, K, V
   extern __shared__ float sram[];
   float* s_q = sram;
-  float* s_k = s_q + BS*MAGIC;
-  float* s_v = s_k + BS*MAGIC;
+  float* s_k = s_q + BS*MAXD;
+  float* s_v = s_k + BS*MAXD;
 
   // Load Q to SRAM
   if (tgt_idx < N) {
@@ -88,7 +124,7 @@ __global__ void flashAttentionKernel(const T* Q, const T* K, const T* V,
   __syncthreads();
 
   // Define local arrays out, S
-  float out[MAGIC] = {};
+  float out[MAXD] = {};
   float S[BS];
 
   // Prepare
@@ -171,7 +207,7 @@ void flashAttentionLaunch(const T* Q, const T* K, const T* V, T* O,
   cudaMemset(O, 0, B * nqh * N * d * sizeof(T));
 
   // Launch kernel
-  const int sram_size = 3 * BS * MAGIC * sizeof(float);
+  const int sram_size = 3 * BS * MAXD * sizeof(float);
   dim3 grid_dim(B, nqh, Tr);
   dim3 block_dim(BS);
   flashAttentionKernel<<<grid_dim, block_dim, sram_size>>>(
