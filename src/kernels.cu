@@ -8,7 +8,7 @@ template <typename T>
 __device__ T warpReduce(T val, int warp_size) {
   #pragma unroll
   for (int stride = warp_size >> 1; stride > 0; stride >>= 1) {
-    val += __shfl_down_sync(0xffffffff, val, stride);
+    val += __shfl_down_sync((1LL << warp_size) - 1, val, stride);
   }
   return val;
 }
