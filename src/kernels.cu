@@ -40,17 +40,16 @@ __global__ void traceKernel(T* A, T* result, int n, int cols,
  * @brief Computes the trace of a matrix.
  *
  * The trace of a matrix is defined as the sum of its diagonal elements.
- * This function expects a flattened row-major matrix stored in a* std::vector.
- * If the matrix is not square, the trace will sum up* elements along the main
- * diagonal up to the smaller of rows or cols.
+ * This function expects a flattened row-major matrix stored in a
+ * std::vector. If the matrix is not square, the trace will sum up
+ * elements along the main diagonal up to the smaller of rows or cols.
  *
  * @tparam T The numeric type of matrix elements (e.g., float, int).
- * @param h_input A flattened matrix of size rows* cols.
+ * @param h_input A flattened matrix of size rows * cols.
  * @param rows Number of rows in the matrix.
  * @param cols Number of columns in the matrix.
  * @return The trace (sum of diagonal values) of the matrix.
  */
-
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // Get warp size
@@ -216,26 +215,20 @@ void flashAttentionLaunch(const T* Q, const T* K, const T* V, T* O,
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
- *
+ * 
  * @tparam T Data type (float) for input/output tensors
- * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads,
- * head_dim]
- * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads,
- * head_dim]
- * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads,
- * head_dim]
- * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len,
- * query_heads, head_dim]
+ * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
+ * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
+ * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
+ * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] batch_size Batch dimension size
  * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length
+ * @param[in] src_seq_len Source sequence length  
  * @param[in] query_heads Number of query attention heads
- * @param[in] kv_heads Number of key/value heads (supports grouped query
- * attention)
+ * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
  * @param[in] head_dim Dimension size of each attention head
  * @param[in] is_causal Whether to apply causal masking
  */
-
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
