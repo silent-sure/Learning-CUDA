@@ -1,7 +1,40 @@
-#include <vector>
 #include <musa_fp16.h>
+#include <cassert>
+#include <vector>
 
 #include "../tester/utils.h"
+
+template <typename T>
+__device__ T warpReduce(T val, int warp_size) {
+  #pragma unroll
+  for (int stride = warp_size >> 1; stride > 0; stride >>= 1) {
+    val += __shfl_down_sync((1LL << warp_size) - 1, val, stride);
+  }
+  return val;
+}
+
+template <typename T>
+__global__ void traceKernel(T* A, T* result, int n, int cols,
+    int warp_size, int num_warps) {
+  int idx = threadIdx.x + blockIdx.x*blockDim.x;
+  int warp_id = threadIdx.x / warp_size;
+  int lane_id = threadIdx.x % warp_size;
+  extern __shared__ char pool[];
+  T* smem = (T*)pool;
+  T val = idx < n ? A[idx*cols + idx] : T(0);
+  T warp_sum = warpReduce(val, warp_size);
+  if (lane_id == 0) {
+    smem[warp_id] = warp_sum;
+  }
+  __syncthreads();
+  if (warp_id == 0) {
+    T block_sum = lane_id < num_warps ? smem[lane_id] : T(0);
+    block_sum = warpReduce(block_sum, warp_size);
+    if (lane_id == 0) {
+      atomicAdd(result, block_sum);
+    }
+  }
+}
 
 /**
  * @brief Computes the trace of a matrix.
@@ -19,8 +52,165 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  // Get warp size
+  musaDeviceProp prop;
+  musaGetDeviceProperties(&prop, 0);
+  const int warp_size = prop.warpSize;
+
+  // Prepare
+  T* d_input;
+  T* d_result;
+  musaMalloc((void**)&d_input, rows * cols * sizeof(T));
+  musaMalloc((void**)&d_result, sizeof(T));
+  musaMemcpy(d_input, h_input.data(), rows * cols * sizeof(T), musaMemcpyHostToDevice);
+  musaMemset(d_result, 0, sizeof(T));
+
+  // Launch kernel
+  int block_size = 256;
+  int n = std::min(rows, cols);
+  int num_blocks = (n + block_size - 1) / block_size;
+  int num_warps = (block_size + warp_size - 1) / warp_size;
+  traceKernel<<<num_blocks, block_size, num_warps * sizeof(T)>>>(
+    d_input, d_result, n, int(cols), warp_size, num_warps
+  );
+  musaDeviceSynchronize();
+
+  // Copy result, wrap up
+  T result;
+  musaMemcpy(&result, d_result, sizeof(T), musaMemcpyDeviceToHost);
+  musaFree(d_input);
+  musaFree(d_result);
+  return result;
+}
+
+constexpr int BS = 64;
+constexpr int MAXD = 64;
+
+__device__ __forceinline__ int swizzle(int r, int c) {
+  return r << 6 | (c ^ r);
+}
+
+template <typename T>
+__global__ void flashAttentionKernel(const T* Q, const T* K, const T* V,
+    int N, int M, int d, int Tc, int Tr, float softmax_scale,
+    int n_kv_h, int num, T* O, bool is_causal) {
+  // Batch, head, sequence tile, index in tile
+  int bx = blockIdx.x, by = blockIdx.y, bz = blockIdx.z, tx = threadIdx.x;
+  // Global index
+  int tgt_idx = bz*BS + tx;
+
+  // Addresses of Q, O concerned; offset for K and V
+  const T* Q_concerned = Q + ((bx*N + tgt_idx) * gridDim.y + by) * d;
+  T* O_concerned = O + ((bx*N + tgt_idx) * gridDim.y + by) * d;
+  int kv_offset = (bx*M*n_kv_h + by/num) * d;
+
+  // Define SRAM for Q, K, V
+  extern __shared__ float sram[];
+  float* s_q = sram;
+  float* s_k = s_q + BS*MAXD;
+  float* s_v = s_k + BS*MAXD;
+
+  // Load Q to SRAM
+  if (tgt_idx < N) {
+    for (int x = 0; x < d; ++x) {
+      s_q[swizzle(tx, x)] = float(Q_concerned[x]);
+    }
+  } else {
+    for (int x = 0; x < d; ++x) {
+      s_q[swizzle(tx, x)] = 0.f;
+    }
+  }
+  __syncthreads();
+
+  // Define local arrays out, S
+  float out[MAXD] = {};
+  float S[BS];
+
+  // Prepare
+  float m = -INFINITY, l = 0.f;
+  int j_limit = Tc;
+  if (is_causal == true && bz + 1 < j_limit) {
+    j_limit = bz + 1;
+  }
+
+  // Main loop
+  for (int j = 0; j < j_limit; ++j) {
+    int src_idx = j*BS + tx;
+    if (src_idx < M) {
+      for (int x = 0; x < d; ++x) {
+        int from = kv_offset + src_idx*n_kv_h*d + x, to = swizzle(tx, x);
+        s_k[to] = float(K[from]), s_v[to] = float(V[from]);
+      }
+    } else {
+      for (int x = 0; x < d; ++x) {
+        int to = swizzle(tx, x);
+        s_k[to] = s_v[to] = 0.f;
+      }
+    }
+    __syncthreads();
+    // Compute m_new, S
+    float m_new = m;
+    int y_limit = M - j*BS;
+    if (BS < y_limit) y_limit = BS;
+    if (is_causal) {
+      int causal_limit = tgt_idx - j*BS + 1;
+      if (causal_limit < y_limit) y_limit = causal_limit;
+    }
+    for (int y = 0; y < y_limit; y++) {
+      float sum = 0;
+      for (int x = 0; x < d; x++) {
+        sum = fmaf(s_q[swizzle(tx, x)], s_k[swizzle(y, x)], sum);
+      }
+      sum *= softmax_scale;
+      if (sum > m_new) {
+        m_new = sum;
+      }
+      S[y] = sum;
+    }
+    // Compute l, O
+    float alpha = __expf(m - m_new);
+    l *= alpha;
+    for (int x = 0; x < d; ++x) {
+      out[x] *= alpha;
+    }
+    for (int y = 0; y < y_limit; y++) {
+      float p = __expf(S[y] - m_new);
+      l += p;
+      for (int x = 0; x < d; ++x) {
+        out[x] = fmaf(p, s_v[swizzle(y, x)], out[x]);
+      }
+    }
+    __syncthreads();
+    // Update m
+    m = m_new;
+  }
+
+  // Normalize
+  if (tgt_idx < N) {
+    for (int x = 0; x < d; ++x) {
+      O_concerned[x] = T(out[x] / l);
+    }
+  }
+  __syncthreads();
+}
+
+template <typename T>
+void flashAttentionLaunch(const T* Q, const T* K, const T* V, T* O,
+    int B, int nqh, int nkvh, int N, int M, int d, bool is_causal) {
+  const int num = nqh / nkvh;  // GQA grouping factor
+  const int Tc = int(ceil(double(M) / BS));
+  const int Tr = int(ceil(double(N) / BS));
+  const float softmax_scale = float(1. / sqrt(d));
+
+  // Initialize O
+  musaMemset(O, 0, B * nqh * N * d * sizeof(T));
+
+  // Launch kernel
+  const int sram_size = 3 * BS * MAXD * sizeof(float);
+  dim3 grid_dim(B, nqh, Tr);
+  dim3 block_dim(BS);
+  flashAttentionKernel<<<grid_dim, block_dim, sram_size>>>(
+    Q, K, V, N, M, d, Tc, Tr, softmax_scale, nkvh, num, O, is_causal);
 }
 
 /**
@@ -42,8 +232,30 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim,
+                    bool is_causal) {
+  T* d_q;
+  T* d_k;
+  T* d_v;
+  T* d_o;
+  musaMalloc((void**)&d_q, h_q.size() * sizeof(T));
+  musaMalloc((void**)&d_k, h_k.size() * sizeof(T));
+  musaMalloc((void**)&d_v, h_v.size() * sizeof(T));
+  musaMalloc((void**)&d_o, h_o.size() * sizeof(T));
+  musaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(T), musaMemcpyHostToDevice);
+  musaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(T), musaMemcpyHostToDevice);
+  musaMemcpy(d_v, h_v.data(), h_v.size() * sizeof(T), musaMemcpyHostToDevice);
+  flashAttentionLaunch(d_q, d_k, d_v, d_o, batch_size,
+      query_heads, kv_heads, target_seq_len, src_seq_len, head_dim, is_causal);
+  T* h_o2 = (T*)malloc(h_q.size() * sizeof(T));
+  musaMemcpy(h_o2, d_o, h_q.size() * sizeof(T), musaMemcpyDeviceToHost);
+  h_o = std::vector<T>(h_o2, h_o2 + h_q.size());
+  musaFree(d_q);
+  musaFree(d_k);
+  musaFree(d_v);
+  musaFree(d_o);
+  free(h_o2);
 }
 
 // *********************************************************************
